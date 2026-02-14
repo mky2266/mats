@@ -1,0 +1,12 @@
+# 不要上傳的檔案
+.env
+node_modules/
+logs/
+*.log
+bot_state_*.json
+market_data.json
+.env.backup
+
+# 系統檔案
+.DS_Store
+Thumbs.db

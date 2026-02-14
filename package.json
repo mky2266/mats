@@ -1,0 +1,10 @@
+{
+  "name": "mats",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "ccxt": "^4.2.25",
+    "dotenv": "^16.4.1",
+    "technicalindicators": "^3.1.0"
+  }
+}
