@@ -26,7 +26,6 @@ function initExchange() {
     validateApiKeys();
     const config = getExchangeConfig();
     
-    // 創建交易所實例
     const ExchangeClass = ccxt[config.id];
     if (!ExchangeClass) {
         throw new Error(`CCXT 不支援交易所: ${config.id}`);
@@ -35,6 +34,190 @@ function initExchange() {
     const exchangeConfig = {
         apiKey: config.apiKey,
         secret: config.secret,
+        enableRateLimit: config.enableRateLimit,
+        options: config.options
+    };
+    
+    if (config.password) {
+        exchangeConfig.password = config.password;
+    }
+    
+    return new ExchangeClass(exchangeConfig);
+}
+
+const exchange = initExchange();
+
+async function log(msg) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] ${msg}`);
+}
+
+async function getTradableSymbols() {
+    try {
+        // 強制載入 future 市場
+        if (EXCHANGE_NAME === 'binance') {
+            await exchange.loadMarkets(true);  // 強制重新載入
+        } else {
+            await exchange.loadMarkets();
+        }
+        
+        const markets = exchange.markets;
+        
+        log(`總市場數: ${Object.keys(markets).length}`);
+        
+        // 使用更簡單的篩選條件
+        const tradableSymbols = Object.keys(markets).filter(symbol => {
+            const market = markets[symbol];
+            
+            // 基本條件
+            if (!market.active || market.quote !== 'USDT') {
+                return false;
+            }
+            
+            // 排除槓桿代幣
+            if (symbol.includes('UP/') || symbol.includes('DOWN/') || 
+                symbol.includes('BULL/') || symbol.includes('BEAR/')) {
+                return false;
+            }
+            
+            if (EXCHANGE_NAME === 'binance') {
+                // Binance: 只要是 future 且包含 :USDT
+                return market.type === 'future' && symbol.includes(':USDT');
+            } else {
+                // 其他交易所
+                return (market.type === 'swap' || market.linear === true || market.contract === true);
+            }
+        });
+        
+        log(`找到 ${tradableSymbols.length} 個可交易的 USDT 永續合約`);
+        
+        if (tradableSymbols.length > 0) {
+            log(`前 10 個: ${tradableSymbols.slice(0, 10).join(', ')}`);
+        }
+        
+        return new Set(tradableSymbols);
+    } catch (e) {
+        log(`獲取可交易幣種列表失敗: ${e.message}`);
+        return new Set();
+    }
+}
+
+async function getTopCoinsByVolume(count = CONFIG.topN) {
+    log(`正在獲取成交量前 ${count} 的幣種...`);
+    try {
+        const tradableSymbols = await getTradableSymbols();
+        if (tradableSymbols.size === 0) {
+            log('無法獲取可交易幣種列表');
+            return [];
+        }
+
+        log(`正在獲取市場行情數據...`);
+        const tickers = await exchange.fetchTickers();
+        log(`獲取到 ${Object.keys(tickers).length} 個行情數據`);
+        
+        const usdtTickers = Object.values(tickers)
+            .filter(t => {
+                if (!t.symbol) return false;
+                
+                const hasUSDTQuote = t.symbol.includes('/USDT');
+                const notLeveraged = !t.symbol.includes('UP/') &&
+                    !t.symbol.includes('DOWN/') &&
+                    !t.symbol.includes('BULL/') &&
+                    !t.symbol.includes('BEAR/');
+                const isTradable = tradableSymbols.has(t.symbol);
+                
+                return hasUSDTQuote && notLeveraged && isTradable;
+            })
+            .sort((a, b) => (b.quoteVolume || 0) - (a.quoteVolume || 0))
+            .slice(0, count);
+        
+        log(`成功篩選出 ${usdtTickers.length} 個可交易幣種`);
+        if (usdtTickers.length > 0) {
+            log(`前5個幣種: ${usdtTickers.slice(0, 5).map(t => t.symbol).join(', ')}`);
+        }
+        return usdtTickers.map(t => t.symbol);
+    } catch (e) {
+        log(`獲取幣種失敗: ${e.message}`);
+        return [];
+    }
+}
+
+async function calculateIndicators(symbol) {
+    log(`正在獲取 ${symbol} 的數據...`);
+    try {
+        const timeframe = normalizeTimeframe(CONFIG.timeframe);
+        const ohlcv = await exchange.fetchOHLCV(symbol, timeframe, undefined, 30);
+        
+        if (!ohlcv || ohlcv.length < 2) {
+            log(`${symbol} 的 OHLCV 數據不足，僅有 ${ohlcv?.length || 0} 筆`);
+            return null;
+        }
+
+        const closes = ohlcv.map(c => c[4]);
+        const volumes = ohlcv.map(c => c[5]);
+        const timestamps = ohlcv.map(c => c[0]);
+
+        const currentPrice = closes[closes.length - 1];
+        const lastVolume = volumes[volumes.length - 1];
+        const lastTimestamp = timestamps[timestamps.length - 1];
+
+        return {
+            symbol: symbol.replace(':USDT', '').replace('/', ''),
+            price: currentPrice,
+            volume_4h: lastVolume,
+            timestamp: lastTimestamp
+        };
+    } catch (e) {
+        log(`計算 ${symbol} 指標時出錯: ${e.message}`);
+        return null;
+    }
+}
+
+async function runMarketScanner() {
+    logExchangeInfo();
+    log("🚀 市場掃描器啟動（每 12 小時掃描一次）");
+    
+    while (true) {
+        try {
+            log("========================================");
+            log("開始新一輪市場掃描...");
+            
+            const topSymbols = await getTopCoinsByVolume();
+            if (topSymbols.length === 0) {
+                log("無法獲取幣種列表，將在下次循環重試。");
+            } else {
+                const marketData = [];
+                for (const symbol of topSymbols) {
+                    const indicators = await calculateIndicators(symbol);
+                    if (indicators) {
+                        marketData.push(indicators);
+                    }
+                    await new Promise(r => setTimeout(r, 250)); 
+                }
+
+                marketData.sort((a, b) => b.volume_4h - a.volume_4h);
+
+                const outputPath = path.join(process.cwd(), CONFIG.outputFile);
+                fs.writeFileSync(outputPath, JSON.stringify(marketData, null, 2));
+                log(`✅ 市場數據已儲存至 ${outputPath}`);
+                log(`✅ 共掃描 ${marketData.length} 個幣種`);
+            }
+            
+            const nextScanTime = new Date(Date.now() + CONFIG.scanInterval);
+            log(`⏰ 下次掃描時間：${nextScanTime.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}`);
+            log("========================================");
+            
+            await new Promise(r => setTimeout(r, CONFIG.scanInterval));
+            
+        } catch (e) {
+            log(`❌ 市場掃描器錯誤: ${e.message}`);
+            log(`將在 1 分鐘後重試...`);
+            await new Promise(r => setTimeout(r, 60000));
+        }
+    }
+}
+
+runMarketScanner();        secret: config.secret,
         enableRateLimit: config.enableRateLimit,
         options: config.options
     };
