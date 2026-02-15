@@ -70,8 +70,10 @@ async function getTradableSymbols() {
             
             if (EXCHANGE_NAME === 'binance') {
                 // 只取永續合約，排除季度交割合約
-                return market.type === 'future' && symbol.includes(':USDT') &&
-                    (!market.info.contractType || market.info.contractType === 'PERPETUAL');
+                const isSwapOrFuture = market.type === 'future' || market.type === 'swap';
+                const hasUSDT = symbol.includes(':USDT');
+                const isPerpetual = !market.info.contractType || market.info.contractType === 'PERPETUAL';
+                return isSwapOrFuture && hasUSDT && isPerpetual;
             } else {
                 return market.type === 'swap' || market.linear === true;
             }
