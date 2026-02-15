@@ -97,15 +97,28 @@ async function getTopCoinsByVolume(count = CONFIG.topN) {
         const usdtTickers = Object.values(tickers)
             .filter(t => {
                 if (!t.symbol) return false;
-                return t.symbol.includes('/USDT') && 
-                       !t.symbol.includes('UP/') &&
-                       !t.symbol.includes('DOWN/') &&
-                       tradableSymbols.has(t.symbol);
+                if (!t.symbol.includes('/USDT')) return false;
+                if (t.symbol.includes('UP/') || t.symbol.includes('DOWN/') ||
+                    t.symbol.includes('BULL/') || t.symbol.includes('BEAR/')) return false;
+
+                // 嘗試多種格式比對，適應不同交易所回傳的 ticker symbol 格式
+                const symbolWithSuffix = t.symbol.includes(':USDT') ? t.symbol : `${t.symbol}:USDT`;
+                const symbolWithoutSuffix = t.symbol.replace(':USDT', '');
+
+                return tradableSymbols.has(t.symbol) ||
+                       tradableSymbols.has(symbolWithSuffix) ||
+                       tradableSymbols.has(symbolWithoutSuffix);
             })
             .sort((a, b) => (b.quoteVolume || 0) - (a.quoteVolume || 0))
             .slice(0, count);
-        
-        return usdtTickers.map(t => t.symbol);
+
+        // 統一回傳格式為 tradableSymbols 中的格式（例如 BTC/USDT:USDT）
+        return usdtTickers.map(t => {
+            const symbolWithSuffix = t.symbol.includes(':USDT') ? t.symbol : `${t.symbol}:USDT`;
+            if (tradableSymbols.has(symbolWithSuffix)) return symbolWithSuffix;
+            if (tradableSymbols.has(t.symbol)) return t.symbol;
+            return symbolWithSuffix;
+        });
     } catch (e) {
         log(`獲取幣種失敗: ${e.message}`);
         return [];
