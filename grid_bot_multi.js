@@ -201,10 +201,38 @@ async function findBestCandidateFromData() {
     return { symbol: bestCandidate.symbol, score: bestCandidate.volatilityScore };
 }
 
+async function closeAllPositions(symbol) {
+    if (CONFIG.simMode) return;
+    try {
+        log(`🗑️ 取消 ${symbol} 的所有掛單...`);
+        await exchange.cancelAllOrders(symbol);
+
+        log(`📊 檢查 ${symbol} 的持倉...`);
+        const positions = await exchange.fetchPositions([symbol]);
+        for (const pos of positions) {
+            const contracts = parseFloat(pos.contracts);
+            if (contracts > 0) {
+                const side = pos.side === 'long' ? 'sell' : 'buy';
+                log(`🔄 平倉 ${pos.side} 倉位: ${contracts} 張`);
+                await exchange.createOrder(symbol, 'market', side, contracts, undefined, { reduceOnly: true });
+            }
+        }
+        log(`✅ ${symbol} 已完全平倉`);
+    } catch (e) {
+        log(`❌ 平倉失敗: ${e.message}`);
+    }
+}
+
 async function initializeGrid() {
     try {
         let currentSymbol = CONFIG.symbol;
-        
+
+        // 破網重置前先平掉所有倉位，避免倉位累積
+        if (gridState.isActive) {
+            log(`🧹 重置前先清空所有倉位...`);
+            await closeAllPositions(currentSymbol);
+        }
+
         if (CONFIG.enableRotation && Date.now() - gridState.lastRotationCheck > CONFIG.rotationInterval) {
             gridState.lastRotationCheck = Date.now();
             
@@ -432,32 +460,55 @@ async function monitorGrid() {
                 const openOrders = await exchange.fetchOpenOrders(CONFIG.symbol);
                 const openOrderIds = new Set(openOrders.map(o => o.id));
                 
+                // 計算目前總持倉名義價值，避免超過投資上限
+                async function getTotalPositionNotional(symbol) {
+                    try {
+                        const positions = await exchange.fetchPositions([symbol]);
+                        let total = 0;
+                        for (const pos of positions) {
+                            total += Math.abs(parseFloat(pos.notional) || 0);
+                        }
+                        return total;
+                    } catch (e) {
+                        log(`獲取持倉總量失敗: ${e.message}`);
+                        return 0;
+                    }
+                }
+
                 for (let order of gridState.orders) {
                     if (order.status === 'open' && !openOrderIds.has(order.id)) {
                         log(`✅ [成交] ${order.side} @ ${order.price}`);
                         order.status = 'filled';
-                        
+
+                        // 補單前檢查總持倉是否超過投資上限
+                        const totalNotional = await getTotalPositionNotional(CONFIG.symbol);
+                        const maxNotional = CONFIG.investment * CONFIG.leverage;
+                        if (totalNotional >= maxNotional) {
+                            log(`⚠️ 總持倉 ${totalNotional.toFixed(2)}U 已達上限 ${maxNotional}U，跳過補單`);
+                            continue;
+                        }
+
                         const newSide = order.side === 'buy' ? 'sell' : 'buy';
                         const newPrice = order.side === 'buy' ? order.price + gridState.gridStep : order.price - gridState.gridStep;
-                        
+
                         const notionalPerGrid = (CONFIG.investment * CONFIG.leverage * 0.8) / CONFIG.gridCount;
                         let newAmount = notionalPerGrid / newPrice;
-                        
+
                         // 使用交易所精度
                         try {
                             newAmount = exchange.amountToPrecision(CONFIG.symbol, newAmount);
                         } catch (e) {
                             newAmount = Math.floor(newAmount);
                         }
-                        
-                        if (newAmount === 0 || newAmount < 1) continue; 
+
+                        if (newAmount === 0 || newAmount < 1) continue;
 
                         try {
                             const params = { 'timeInForce': 'GTX' };
                             const newOrder = await exchange.createOrder(CONFIG.symbol, 'limit', newSide, newAmount, newPrice, params);
-                            
+
                             gridState.orders.push({ id: newOrder.id, price: newPrice, side: newSide, status: 'open' });
-                            log(`🔄 [補單] ${newSide} @ ${newPrice.toFixed(4)} (量: ${newAmount})`);
+                            log(`🔄 [補單] ${newSide} @ ${newPrice.toFixed(4)} (量: ${newAmount}) | 總持倉: ${totalNotional.toFixed(2)}U / ${maxNotional}U`);
                             notifyUser(`💰 網格成交！補單 ${newSide} @ ${newPrice.toFixed(4)}`);
                         } catch (e) {
                             log(`補單失敗: ${e.message}`);
