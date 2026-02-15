@@ -839,7 +839,7 @@ pm2 install pm2-web
 ```javascript
 const CONFIG = {
     symbol: 'DUSK/USDT:USDT',  // 交易對
-    investment: 150,            // ← 網格總投入（USDT）
+    investment: 180,            // ← 網格總投入（USDT）
     gridCount: 10,              // 網格數量
     leverage: 1,                // 槓桿倍數（建議 1-2）
 };
@@ -1098,7 +1098,7 @@ nano grid_bot_multi.js
 ```javascript
 const CONFIG = {
     symbol: 'DUSK/USDT:USDT',    // 交易對
-    investment: 150,              // ← 總投入金額（USDT）
+    investment: 180,              // ← 總投入金額（USDT）
     gridCount: 10,                // 網格數量
     leverage: 1,                  // 槓桿倍數（建議 1-2）
     checkInterval: 30000,         // 檢查間隔（毫秒）
@@ -1222,7 +1222,7 @@ investmentPerTrade: 40,  // 24% 給趨勢（3×40）
 | 配置檔 | 配置項 | 用途 | 預設值 |
 |--------|--------|------|--------|
 | `exchange_config.js` | `EXCHANGE_NAME` | 選擇交易所 | 'binance' |
-| `grid_bot_multi.js` | `investment` | 網格投入 | 150 USDT |
+| `grid_bot_multi.js` | `investment` | 網格投入 | 180 USDT |
 | `grid_bot_multi.js` | `leverage` | 網格槓桿 | 1 |
 | `bot_multi.js` | `investmentPerTrade` | 趨勢單筆 | 15 USDT |
 | `bot_multi.js` | `maxPositions` | 趨勢倉位 | 2 |
@@ -1581,6 +1581,15 @@ pm2 flush
 # 日誌輪替
 pm2 install pm2-logrotate
 ```
+
+---
+
+## 📝 更新日誌
+
+### v3.3 (2026-02-15)
+- 🐛 修正網格機器人倉位累積問題：破網重置前自動平掉所有持倉，避免舊倉位疊加
+- 🐛 修正補單沒有上限問題：補單前檢查總持倉名義價值，超過 `investment × leverage` 上限時停止補單
+- ✅ 新增 `closeAllPositions()` 函數統一處理取消掛單與平倉邏輯
 
 ---
 
