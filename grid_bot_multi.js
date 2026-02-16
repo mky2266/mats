@@ -47,6 +47,11 @@ const CONFIG = {
     // 模式
     simMode: false,
 
+    // ===== 趨勢過濾設定 =====
+    trendFilterEnabled: true,
+    trendMaPeriod: 20,               // 使用 20 根 4h K 線的 MA
+    trendDeviationThreshold: 0.03,   // 價格偏離 MA 超過 3% 視為趨勢市場，暫停
+
     // ===== 風控設定 =====
     stopLossEnabled: true,
     stopLossPercent: 0.15,       // 單次虧損超過投資額 15% 停止（180U × 15% = 27U）
@@ -219,6 +224,42 @@ async function getVolatilityScore(symbol) {
     return (atr / price);
 }
 
+// ===== 趨勢過濾 =====
+// 計算簡單移動平均線（SMA）
+async function getSMA(symbol, period, timeframe = '4h') {
+    try {
+        const tf = normalizeTimeframe(timeframe);
+        const ohlcv = await exchange.fetchOHLCV(symbol, tf, undefined, period + 5);
+        const closes = ohlcv.map(c => c[4]);
+        if (closes.length < period) return null;
+        const slice = closes.slice(-period);
+        return slice.reduce((a, b) => a + b, 0) / period;
+    } catch (e) {
+        log(`SMA計算失敗 ${symbol}: ${e.message}`);
+        return null;
+    }
+}
+
+// 判斷是否為橫盤市場（適合網格交易）
+// 若價格偏離 MA 超過閾值，視為趨勢市場，暫停交易
+async function isSidewaysMarket(symbol) {
+    if (!CONFIG.trendFilterEnabled) return true; // 未啟用則預設允許交易
+
+    const price = await getMarketPrice(symbol);
+    const ma = await getSMA(symbol, CONFIG.trendMaPeriod);
+
+    if (!price || !ma) {
+        log(`⚠️ 趨勢過濾：無法計算 MA，允許交易`);
+        return true;
+    }
+
+    const deviation = Math.abs(price - ma) / ma;
+    const isSideways = deviation <= CONFIG.trendDeviationThreshold;
+
+    log(`📊 趨勢過濾 | 價格: ${price.toFixed(4)} | MA${CONFIG.trendMaPeriod}: ${ma.toFixed(4)} | 偏離: ${(deviation * 100).toFixed(2)}% | ${isSideways ? '✅ 橫盤' : '⚠️ 趨勢中'}`);
+    return isSideways;
+}
+
 async function readMarketData() {
     try {
         const marketDataPath = path.join(__dirname, 'market_data.json'); 
@@ -325,6 +366,14 @@ async function initializeGrid() {
         }
 
         let currentSymbol = CONFIG.symbol;
+
+        // 趨勢過濾：橫盤才開網格
+        const sideways = await isSidewaysMarket(currentSymbol);
+        if (!sideways) {
+            log(`⚠️ [趨勢過濾] ${currentSymbol} 目前處於趨勢行情，暫停開網格，等待橫盤...`);
+            notifyUser(`⚠️ 趨勢過濾：${currentSymbol} 趨勢行情，暫停開網格`);
+            return;
+        }
 
         // 重置前先平掉所有倉位，避免倉位累積（包含首次啟動）
         log(`🧹 初始化前先清空所有倉位...`);
