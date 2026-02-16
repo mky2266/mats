@@ -45,7 +45,13 @@ const CONFIG = {
     rotationCooldown: 60000 * 60 * 2,          // 輪動後至少 2 小時才能再次輪動
 
     // 模式
-    simMode: false           
+    simMode: false,
+
+    // ===== 風控設定 =====
+    stopLossEnabled: true,
+    stopLossPercent: 0.15,       // 單次虧損超過投資額 15% 停止（180U × 15% = 27U）
+    dailyLossLimit: 0.20,        // 每日虧損超過投資額 20% 暫停到隔天（36U）
+    maxDrawdownPercent: 0.30,    // 從高點回撤超過 30% 停止（54U）
 };
 // --- END: FIX for HANKED_SIZE and constants ---
 
@@ -81,11 +87,17 @@ let gridState = {
     upperPrice: 0,
     lowerPrice: 0,
     gridStep: 0,
-    orders: [], 
+    orders: [],
     lastRebalanceTime: 0,
     lastRotationCheck: Date.now(),
-    lastRotationTime: 0,          // 記錄最後一次輪動的時間
-    entryEquity: CONFIG.investment
+    lastRotationTime: 0,
+    entryEquity: CONFIG.investment,
+
+    // 風控狀態
+    peakEquity: CONFIG.investment,  // 歷史最高權益（用於計算回撤）
+    dailyLoss: 0,                   // 當日累計虧損
+    dailyLossDate: '',              // 記錄日期（用於每日重置）
+    stopLossTriggered: false,       // 停損觸發標記
 };
 
 function log(msg) {
@@ -96,7 +108,75 @@ function log(msg) {
 function notifyUser(message) {
     // Has been corrected: Use the correct Telegram Target ID
     // Using log for now to avoid exec issues, usually main agent handles messaging
-    log(`Notification content: ${message}`); 
+    log(`Notification content: ${message}`);
+}
+
+// ===== 風控機制 =====
+
+async function getCurrentEquity() {
+    try {
+        const balance = await exchange.fetchBalance();
+        return parseFloat(balance.total?.USDT || balance.USDT?.total || 0);
+    } catch (e) {
+        log(`⚠️ 無法取得帳戶餘額: ${e.message}`);
+        return null;
+    }
+}
+
+async function checkStopLoss() {
+    if (!CONFIG.stopLossEnabled || CONFIG.simMode) return false;
+
+    const equity = await getCurrentEquity();
+    if (equity === null) return false;
+
+    const today = new Date().toISOString().slice(0, 10);
+
+    // 每日重置
+    if (gridState.dailyLossDate !== today) {
+        gridState.dailyLoss = 0;
+        gridState.dailyLossDate = today;
+        log(`📅 新的一天，每日虧損計數重置`);
+    }
+
+    // 更新歷史最高權益
+    if (equity > gridState.peakEquity) {
+        gridState.peakEquity = equity;
+    }
+
+    const entryEquity = gridState.entryEquity || CONFIG.investment;
+    const currentLoss = entryEquity - equity;
+    const drawdown = gridState.peakEquity - equity;
+
+    // 第一道：單次虧損停損
+    const stopLossLimit = CONFIG.investment * CONFIG.stopLossPercent;
+    if (currentLoss >= stopLossLimit) {
+        log(`🛑 [停損] 單次虧損 ${currentLoss.toFixed(2)}U 超過上限 ${stopLossLimit.toFixed(2)}U，停止交易！`);
+        notifyUser(`🛑 停損觸發！虧損 ${currentLoss.toFixed(2)}U 超過 ${(CONFIG.stopLossPercent * 100).toFixed(0)}% 上限`);
+        gridState.stopLossTriggered = true;
+        return true;
+    }
+
+    // 第二道：每日虧損上限
+    const dailyLossLimit = CONFIG.investment * CONFIG.dailyLossLimit;
+    gridState.dailyLoss = Math.max(gridState.dailyLoss, currentLoss);
+    if (gridState.dailyLoss >= dailyLossLimit) {
+        log(`🛑 [每日停損] 今日虧損 ${gridState.dailyLoss.toFixed(2)}U 超過每日上限 ${dailyLossLimit.toFixed(2)}U，暫停到明天！`);
+        notifyUser(`🛑 每日停損觸發！今日虧損 ${gridState.dailyLoss.toFixed(2)}U`);
+        gridState.stopLossTriggered = true;
+        return true;
+    }
+
+    // 第三道：最大回撤保護
+    const maxDrawdownLimit = CONFIG.investment * CONFIG.maxDrawdownPercent;
+    if (drawdown >= maxDrawdownLimit) {
+        log(`🛑 [回撤停損] 從高點回撤 ${drawdown.toFixed(2)}U 超過上限 ${maxDrawdownLimit.toFixed(2)}U，停止交易！`);
+        notifyUser(`🛑 回撤停損觸發！從高點回撤 ${drawdown.toFixed(2)}U`);
+        gridState.stopLossTriggered = true;
+        return true;
+    }
+
+    log(`✅ 風控檢查正常 | 當前權益: ${equity.toFixed(2)}U | 虧損: ${currentLoss.toFixed(2)}U | 回撤: ${drawdown.toFixed(2)}U`);
+    return false;
 }
 
 async function getMarketPrice(symbol = CONFIG.symbol) {
@@ -431,8 +511,19 @@ async function monitorGrid() {
 
     while (true) {
         try {
+            // 0. 風控停損檢查
+            if (CONFIG.stopLossEnabled) {
+                const shouldStop = await checkStopLoss();
+                if (shouldStop) {
+                    log(`🛑 風控觸發，執行全部平倉並停止機器人...`);
+                    await closeAllPositions(CONFIG.symbol);
+                    log(`🛑 機器人已停止。請檢查帳戶狀況後手動重啟。`);
+                    process.exit(1);
+                }
+            }
+
             const price = await getMarketPrice();
-            
+
             // 1. 輪動檢查
             if (CONFIG.enableRotation && Date.now() - gridState.lastRotationCheck > CONFIG.rotationInterval) {
                 gridState.lastRotationCheck = Date.now();
