@@ -111,7 +111,7 @@ function log(msg) {
 }
 
 // NanoClaw IPC 設定：透過寫入 JSON 檔案讓 NanoClaw 發送 WhatsApp 訊息
-const NANOCLAW_IPC_DIR = process.env.NANOCLAW_IPC_DIR || '/root/nanoclaw/data/ipc/main/messages';
+const NANOCLAW_IPC_DIR = process.env.NANOCLAW_IPC_DIR || '/home/mky/nanoclaw/data/ipc/main/messages';
 const NANOCLAW_CHAT_JID = process.env.NANOCLAW_CHAT_JID || '886915721620@s.whatsapp.net';
 
 function notifyUser(message) {
