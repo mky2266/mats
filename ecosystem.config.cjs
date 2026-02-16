@@ -15,7 +15,7 @@ module.exports = {
     },
     {
       name: 'trend-bot',
-      script: './bot_multi.js',
+      script: './trend_bot_multi.js',
       node_args: '--max-old-space-size=512',
       instances: 1,
       exec_mode: 'fork',
