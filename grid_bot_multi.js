@@ -204,20 +204,27 @@ async function findBestCandidateFromData() {
 async function closeAllPositions(symbol) {
     if (CONFIG.simMode) return;
     try {
+        // 取消指定 symbol 的掛單
         log(`🗑️ 取消 ${symbol} 的所有掛單...`);
         await exchange.cancelAllOrders(symbol);
 
-        log(`📊 檢查 ${symbol} 的持倉...`);
-        const positions = await exchange.fetchPositions([symbol]);
+        // 清除所有持倉（不限 symbol，避免輪動後舊倉位殘留）
+        log(`📊 檢查所有持倉...`);
+        const positions = await exchange.fetchPositions();
         for (const pos of positions) {
             const contracts = parseFloat(pos.contracts);
             if (contracts > 0) {
+                const posSymbol = pos.symbol;
                 const side = pos.side === 'long' ? 'sell' : 'buy';
-                log(`🔄 平倉 ${pos.side} 倉位: ${contracts} 張`);
-                await exchange.createOrder(symbol, 'market', side, contracts, undefined, { reduceOnly: true });
+                log(`🔄 平倉 ${posSymbol} ${pos.side} 倉位: ${contracts} 張`);
+                try {
+                    await exchange.createOrder(posSymbol, 'market', side, contracts, undefined, { reduceOnly: true });
+                } catch (e2) {
+                    log(`❌ 平倉 ${posSymbol} 失敗: ${e2.message}`);
+                }
             }
         }
-        log(`✅ ${symbol} 已完全平倉`);
+        log(`✅ 所有倉位已清空`);
     } catch (e) {
         log(`❌ 平倉失敗: ${e.message}`);
     }
