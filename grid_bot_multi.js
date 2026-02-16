@@ -110,10 +110,28 @@ function log(msg) {
     console.log(`[${timestamp}] ${msg}`);
 }
 
+// NanoClaw IPC 設定：透過寫入 JSON 檔案讓 NanoClaw 發送 WhatsApp 訊息
+const NANOCLAW_IPC_DIR = process.env.NANOCLAW_IPC_DIR || '/root/nanoclaw/data/ipc/main/messages';
+const NANOCLAW_CHAT_JID = process.env.NANOCLAW_CHAT_JID || '886915721620@s.whatsapp.net';
+
 function notifyUser(message) {
-    // Has been corrected: Use the correct Telegram Target ID
-    // Using log for now to avoid exec issues, usually main agent handles messaging
-    log(`Notification content: ${message}`);
+    log(`📢 通知: ${message}`);
+    try {
+        if (!fs.existsSync(NANOCLAW_IPC_DIR)) {
+            log(`⚠️ NanoClaw IPC 目錄不存在: ${NANOCLAW_IPC_DIR}，僅記錄 log`);
+            return;
+        }
+        const payload = JSON.stringify({
+            type: 'message',
+            chatJid: NANOCLAW_CHAT_JID,
+            text: `🤖 *網格機器人*\n${message}`
+        });
+        const filename = path.join(NANOCLAW_IPC_DIR, `mats_${Date.now()}.json`);
+        fs.writeFileSync(filename, payload, 'utf-8');
+        log(`✅ 通知已送出至 NanoClaw IPC`);
+    } catch (e) {
+        log(`⚠️ 無法發送通知: ${e.message}`);
+    }
 }
 
 // ===== 風控機制 =====
