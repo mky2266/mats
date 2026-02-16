@@ -232,6 +232,18 @@ async function closeAllPositions(symbol) {
 
 async function initializeGrid() {
     try {
+        // 從 market_data.json 自動選最佳交易對
+        log(`🔍 從 market_data.json 自動選擇交易對...`);
+        const best = await findBestCandidateFromData();
+        if (!best || !best.symbol || best.score === 0) {
+            log(`⚠️ market_data.json 無可用數據，暫停交易，等待下次掃描...`);
+            return;
+        }
+        if (best.symbol !== CONFIG.symbol) {
+            log(`📥 自動選擇交易對: ${best.symbol} (波動性: ${(best.score * 100).toFixed(2)}%)`);
+            CONFIG.symbol = best.symbol;
+        }
+
         let currentSymbol = CONFIG.symbol;
 
         // 重置前先平掉所有倉位，避免倉位累積（包含首次啟動）
