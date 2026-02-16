@@ -39,9 +39,12 @@ const DB_PATH = path.join(__dirname, 'backtest.db');
 
 function initDB() {
     const db = new Database(DB_PATH);
+    // 相容舊資料庫：若 strategy 欄位不存在則新增
+    try { db.exec(`ALTER TABLE backtest_runs ADD COLUMN strategy TEXT NOT NULL DEFAULT 'EMA_CROSSOVER'`); } catch (_) {}
     db.exec(`
         CREATE TABLE IF NOT EXISTS backtest_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy TEXT NOT NULL DEFAULT 'EMA_CROSSOVER',
             run_at TEXT NOT NULL,
             symbol TEXT NOT NULL,
             timeframe TEXT NOT NULL,
@@ -90,13 +93,15 @@ function saveResults(db, config, result) {
 
     const runStmt = db.prepare(`
         INSERT INTO backtest_runs
-        (run_at, symbol, timeframe, days_back, ema_fast, ema_slow, atr_stop_mult, atr_tp_mult,
+        (strategy, run_at, symbol, timeframe, days_back, ema_fast, ema_slow, atr_stop_mult, atr_tp_mult,
          leverage, investment, final_equity, total_pnl, total_pnl_pct, max_drawdown,
          trade_count, win_count, win_rate, avg_win, avg_loss)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    const strategyName = `EMA${config.emaFast}/${config.emaSlow}_ATR${config.atrStopMultiplier}x_${config.timeframe}`;
     const runResult = runStmt.run(
+        strategyName,
         new Date().toISOString(),
         config.symbol, config.timeframe, config.daysBack,
         config.emaFast, config.emaSlow, config.atrStopMultiplier, config.atrTpMultiplier,
@@ -140,18 +145,20 @@ function queryResults(db, symbol) {
         return;
     }
 
-    console.log('\n' + '='.repeat(90));
+    console.log('\n' + '='.repeat(105));
     console.log('📊 歷史回測記錄');
-    console.log('='.repeat(90));
-    console.log(`${'ID'.padEnd(4)} ${'日期'.padEnd(12)} ${'幣種'.padEnd(16)} ${'報酬率'.padEnd(10)} ${'盈虧(U)'.padEnd(10)} ${'回撤'.padEnd(8)} ${'勝率'.padEnd(8)} ${'次數'.padEnd(6)}`);
-    console.log('-'.repeat(90));
+    console.log('='.repeat(105));
+    console.log(`${'ID'.padEnd(4)} ${'日期'.padEnd(12)} ${'策略'.padEnd(24)} ${'幣種'.padEnd(16)} ${'報酬率'.padEnd(10)} ${'盈虧(U)'.padEnd(10)} ${'回撤'.padEnd(8)} ${'勝率'.padEnd(8)} ${'次數'.padEnd(6)}`);
+    console.log('-'.repeat(105));
 
     for (const r of rows) {
         const pnlSign = r.total_pnl >= 0 ? '+' : '';
         const emoji = r.total_pnl >= 0 ? '✅' : '❌';
+        const strategy = (r.strategy || 'EMA_CROSSOVER').padEnd(24);
         console.log(
             `${emoji} ${String(r.id).padEnd(3)} ` +
             `${r.run_at.slice(0, 10).padEnd(12)} ` +
+            `${strategy} ` +
             `${r.symbol.padEnd(16)} ` +
             `${(pnlSign + r.total_pnl_pct.toFixed(1) + '%').padEnd(10)} ` +
             `${(pnlSign + r.total_pnl.toFixed(2)).padEnd(10)} ` +
@@ -161,17 +168,17 @@ function queryResults(db, symbol) {
         );
     }
 
-    // 最佳幣種排名
+    // 最佳幣種排名（依策略分組）
     const best = db.prepare(`
-        SELECT symbol, AVG(total_pnl_pct) as avg_pnl, COUNT(*) as runs
-        FROM backtest_runs GROUP BY symbol ORDER BY avg_pnl DESC LIMIT 5
+        SELECT strategy, symbol, AVG(total_pnl_pct) as avg_pnl, COUNT(*) as runs
+        FROM backtest_runs GROUP BY strategy, symbol ORDER BY avg_pnl DESC LIMIT 10
     `).all();
 
     if (best.length > 1) {
-        console.log('\n🏆 幣種平均績效排名：');
+        console.log('\n🏆 幣種平均績效排名（依策略）：');
         for (const b of best) {
             const sign = b.avg_pnl >= 0 ? '+' : '';
-            console.log(`  ${b.symbol}: ${sign}${b.avg_pnl.toFixed(1)}% (${b.runs} 次回測)`);
+            console.log(`  [${b.strategy || 'EMA_CROSSOVER'}] ${b.symbol}: ${sign}${b.avg_pnl.toFixed(1)}% (${b.runs} 次回測)`);
         }
     }
     console.log('='.repeat(90));

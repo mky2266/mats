@@ -35,9 +35,12 @@ const exchange = new ccxt.binance({ options: { defaultType: 'future' } });
 
 function initDB() {
     const db = new Database(DB_PATH);
+    // 相容舊資料庫：若 strategy 欄位不存在則新增
+    try { db.exec(`ALTER TABLE backtest_runs ADD COLUMN strategy TEXT NOT NULL DEFAULT 'EMA_CROSSOVER'`); } catch (_) {}
     db.exec(`
         CREATE TABLE IF NOT EXISTS backtest_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy TEXT NOT NULL DEFAULT 'EMA_CROSSOVER',
             run_at TEXT NOT NULL,
             symbol TEXT NOT NULL,
             timeframe TEXT NOT NULL,
@@ -190,13 +193,15 @@ function saveResult(db, symbol, result) {
 
     const runStmt = db.prepare(`
         INSERT INTO backtest_runs
-        (run_at, symbol, timeframe, days_back, ema_fast, ema_slow, atr_stop_mult, atr_tp_mult,
+        (strategy, run_at, symbol, timeframe, days_back, ema_fast, ema_slow, atr_stop_mult, atr_tp_mult,
          leverage, investment, final_equity, total_pnl, total_pnl_pct, max_drawdown,
          trade_count, win_count, win_rate, avg_win, avg_loss)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    const strategyName = `EMA${CONFIG.emaFast}/${CONFIG.emaSlow}_ATR${CONFIG.atrStopMultiplier}x_${CONFIG.timeframe}`;
     const r = runStmt.run(
+        strategyName,
         new Date().toISOString(), symbol, CONFIG.timeframe, CONFIG.daysBack,
         CONFIG.emaFast, CONFIG.emaSlow, CONFIG.atrStopMultiplier, CONFIG.atrTpMultiplier,
         CONFIG.leverage, CONFIG.investment,
