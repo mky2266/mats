@@ -22,7 +22,7 @@ dotenv.config({ path: path.join(__dirname, '.env') });
 const HANKED_SIZE = 20; 
 const CONFIG = {
     symbol: 'DUSK/USDT:USDT',    // 修正為合約市場格式
-    investment: 150,        
+    investment: 180,
     gridCount: 10,          
     leverage: 1,            
     checkInterval: 30000,   
