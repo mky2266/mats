@@ -227,11 +227,9 @@ async function initializeGrid() {
     try {
         let currentSymbol = CONFIG.symbol;
 
-        // 破網重置前先平掉所有倉位，避免倉位累積
-        if (gridState.isActive) {
-            log(`🧹 重置前先清空所有倉位...`);
-            await closeAllPositions(currentSymbol);
-        }
+        // 重置前先平掉所有倉位，避免倉位累積（包含首次啟動）
+        log(`🧹 初始化前先清空所有倉位...`);
+        await closeAllPositions(currentSymbol);
 
         if (CONFIG.enableRotation && Date.now() - gridState.lastRotationCheck > CONFIG.rotationInterval) {
             gridState.lastRotationCheck = Date.now();
