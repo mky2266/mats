@@ -555,8 +555,59 @@ async function rotateSymbol(newSymbol) {
     await initializeGrid();
 }
 
+// ===== 每日報表 =====
+let dailyStats = {
+    tradeCount: 0,      // 今日成交次數
+    lastReportDate: '', // 上次報表日期
+};
+
+async function sendDailyReport() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (dailyStats.lastReportDate === today) return; // 今天已發過
+
+    const equity = await getCurrentEquity();
+    const initialEquity = gridState.entryEquity || CONFIG.investment;
+    const pnl = equity !== null ? (equity - initialEquity).toFixed(2) : '無法取得';
+    const pnlPercent = equity !== null ? (((equity - initialEquity) / initialEquity) * 100).toFixed(2) : '-';
+
+    const report = [
+        `📊 每日交易報表 ${today}`,
+        `━━━━━━━━━━━━━━━━`,
+        `交易幣種: ${CONFIG.symbol}`,
+        `帳戶權益: ${equity !== null ? equity.toFixed(2) + ' USDT' : '無法取得'}`,
+        `當日盈虧: ${pnl} USDT (${pnlPercent}%)`,
+        `今日成交: ${dailyStats.tradeCount} 次`,
+        `每日虧損: ${gridState.dailyLoss.toFixed(2)} USDT`,
+        `最高權益: ${gridState.peakEquity.toFixed(2)} USDT`,
+    ].join('\n');
+
+    log(`\n${report}`);
+    notifyUser(report);
+
+    // 重置當日統計
+    dailyStats.tradeCount = 0;
+    dailyStats.lastReportDate = today;
+}
+
+function scheduleDailyReport() {
+    const now = new Date();
+    const next8am = new Date();
+    next8am.setHours(8, 0, 0, 0);
+    if (now >= next8am) {
+        next8am.setDate(next8am.getDate() + 1);
+    }
+    const msUntil8am = next8am - now;
+    log(`📅 每日報表將於 ${next8am.toLocaleString()} 發送`);
+    setTimeout(async () => {
+        await sendDailyReport();
+        setInterval(sendDailyReport, 24 * 60 * 60 * 1000); // 之後每 24 小時
+    }, msUntil8am);
+}
+
 async function monitorGrid() {
     if (!gridState.isActive) await initializeGrid();
+
+    scheduleDailyReport();
 
     while (true) {
         try {
@@ -667,6 +718,7 @@ async function monitorGrid() {
                             gridState.orders.push({ id: newOrder.id, price: newPrice, side: newSide, status: 'open' });
                             log(`🔄 [補單] ${newSide} @ ${newPrice.toFixed(4)} (量: ${newAmount}) | 總持倉: ${totalNotional.toFixed(2)}U / ${maxNotional}U`);
                             notifyUser(`💰 網格成交！補單 ${newSide} @ ${newPrice.toFixed(4)}`);
+                            dailyStats.tradeCount++;
                         } catch (e) {
                             log(`補單失敗: ${e.message}`);
                             if (e.message && e.message.includes('Margin is insufficient')) {
