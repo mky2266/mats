@@ -103,6 +103,10 @@ let gridState = {
     dailyLoss: 0,                   // 當日累計虧損
     dailyLossDate: '',              // 記錄日期（用於每日重置）
     stopLossTriggered: false,       // 停損觸發標記
+
+    // 通知冷卻（避免垃圾訊息）
+    lastTrendNotifyTime: 0,         // 趨勢過濾通知冷卻
+    lastInitRetry: 0,               // 上次嘗試初始化時間
 };
 
 function log(msg) {
@@ -389,7 +393,12 @@ async function initializeGrid() {
         const sideways = await isSidewaysMarket(currentSymbol);
         if (!sideways) {
             log(`⚠️ [趨勢過濾] ${currentSymbol} 目前處於趨勢行情，暫停開網格，等待橫盤...`);
-            notifyUser(`⚠️ 趨勢過濾：${currentSymbol} 趨勢行情，暫停開網格`);
+            // 通知冷卻：1 小時最多發一次，避免垃圾訊息
+            const TREND_NOTIFY_COOLDOWN = 60 * 60 * 1000; // 1 小時
+            if (Date.now() - gridState.lastTrendNotifyTime > TREND_NOTIFY_COOLDOWN) {
+                gridState.lastTrendNotifyTime = Date.now();
+                notifyUser(`⚠️ 趨勢過濾：${currentSymbol} 趨勢行情，暫停開網格`);
+            }
             return;
         }
 
@@ -671,8 +680,20 @@ async function monitorGrid() {
                 }
             }
 
-            // 2. 破網檢查
-            if (price > gridState.upperPrice || price < gridState.lowerPrice) {
+            // 2. 如果網格未啟動，定期重試初始化（每 5 分鐘）
+            if (!gridState.isActive) {
+                const RETRY_INTERVAL = 60000 * 5;
+                if (Date.now() - gridState.lastInitRetry > RETRY_INTERVAL) {
+                    gridState.lastInitRetry = Date.now();
+                    log(`🔁 網格未啟動，嘗試重新初始化...`);
+                    await initializeGrid();
+                }
+                await new Promise(r => setTimeout(r, CONFIG.checkInterval));
+                continue;
+            }
+
+            // 3. 破網檢查（只在網格已啟動時才觸發）
+            if (gridState.isActive && (price > gridState.upperPrice || price < gridState.lowerPrice)) {
                 if (CONFIG.autoRebalance) {
                     if (Date.now() - gridState.lastRebalanceTime > CONFIG.rebalanceCooldown) {
                         log(`🔄 破網重置...`);
@@ -681,7 +702,7 @@ async function monitorGrid() {
                 }
             }
 
-            // 3. 補單邏輯 (實盤)
+            // 4. 補單邏輯 (實盤)
             if (!CONFIG.simMode) {
                 const openOrders = await exchange.fetchOpenOrders(CONFIG.symbol);
                 const openOrderIds = new Set(openOrders.map(o => o.id));
