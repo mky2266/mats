@@ -98,6 +98,7 @@ let gridState = {
     lastRotationCheck: Date.now(),
     lastRotationTime: 0,
     entryEquity: CONFIG.investment,
+    lastTrendNotifyTime: 0,         // 趨勢過濾通知冷卻（避免重複發送）
 
     // 風控狀態
     peakEquity: CONFIG.investment,  // 歷史最高權益（用於計算回撤）
@@ -367,12 +368,12 @@ async function findBestCandidateFromData() {
         return { ...item, finalScore };
     });
 
-    const bestCandidate = scored.reduce((prev, curr) =>
-        curr.finalScore > prev.finalScore ? curr : prev
-    , { symbol: CONFIG.symbol, finalScore: 0 });
+    // 依分數由高到低排序，回傳完整清單供備選
+    scored.sort((a, b) => b.finalScore - a.finalScore);
+    const bestCandidate = scored[0] || { symbol: CONFIG.symbol, finalScore: 0 };
 
     log(`✅ 最佳幣種: ${bestCandidate.symbol} (綜合分數: ${(bestCandidate.finalScore * 100).toFixed(2)})`);
-    return { symbol: bestCandidate.symbol, score: bestCandidate.finalScore };
+    return { symbol: bestCandidate.symbol, score: bestCandidate.finalScore, allCandidates: scored };
 }
 
 async function closeAllPositions(symbol) {
@@ -420,11 +421,33 @@ async function initializeGrid() {
 
         let currentSymbol = CONFIG.symbol;
 
-        // 趨勢過濾：橫盤才開網格
-        const sideways = await isSidewaysMarket(currentSymbol);
-        if (!sideways) {
-            log(`⚠️ [趨勢過濾] ${currentSymbol} 目前處於趨勢行情，暫停開網格，等待橫盤...`);
-            notifyUser(`⚠️ 趨勢過濾：${currentSymbol} 趨勢行情，暫停開網格`);
+        // 趨勢過濾：橫盤才開網格，最佳幣種趨勢時嘗試備選
+        const allCandidates = best.allCandidates || [{ symbol: currentSymbol, finalScore: best.score }];
+        let foundSideways = false;
+
+        for (const candidate of allCandidates) {
+            const sym = candidate.symbol || currentSymbol;
+            const sideways = await isSidewaysMarket(sym);
+            if (sideways) {
+                if (sym !== currentSymbol) {
+                    log(`🔀 備選幣種 ${sym} 為橫盤，切換至此幣種`);
+                    CONFIG.symbol = sym;
+                    currentSymbol = sym;
+                }
+                foundSideways = true;
+                break;
+            } else {
+                log(`⏭️ ${sym} 趨勢中，嘗試下一個...`);
+            }
+        }
+
+        if (!foundSideways) {
+            log(`⚠️ [趨勢過濾] 所有候選幣種均為趨勢行情，暫停等待橫盤...`);
+            const TREND_NOTIFY_COOLDOWN = 60 * 60 * 1000; // 1小時通知一次
+            if (Date.now() - gridState.lastTrendNotifyTime > TREND_NOTIFY_COOLDOWN) {
+                notifyUser(`⚠️ 趨勢過濾：所有候選幣種均在趨勢中，暫停開網格（每小時通知一次）`);
+                gridState.lastTrendNotifyTime = Date.now();
+            }
             return;
         }
 
@@ -568,7 +591,13 @@ async function initializeGrid() {
             orders: newOrders,
             lastRebalanceTime: Date.now(),
             lastRotationCheck: Date.now(),
-            entryEquity: gridState.entryEquity
+            lastRotationTime: gridState.lastRotationTime || 0,
+            lastTrendNotifyTime: gridState.lastTrendNotifyTime || 0,
+            entryEquity: gridState.entryEquity,
+            peakEquity: gridState.peakEquity,
+            dailyLoss: gridState.dailyLoss || 0,
+            dailyLossDate: gridState.dailyLossDate || '',
+            stopLossTriggered: false,
         };
 
         notifyUser(`🕸️ 網格機器人啟動 [${currentSymbol}]\n區間: ${lowerPrice.toFixed(4)} - ${upperPrice.toFixed(4)}`);
