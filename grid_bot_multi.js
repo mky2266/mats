@@ -808,5 +808,17 @@ async function monitorGrid() {
 
 logExchangeInfo();
 log('🚀 網格機器人 3.2 (多交易所支援) 啟動...');
-monitorGrid();
+
+// 啟動時讀取實際帳戶餘額作為風控基準
+(async () => {
+    if (!CONFIG.simMode) {
+        const initialEquity = await getCurrentEquity();
+        if (initialEquity !== null) {
+            gridState.entryEquity = initialEquity;
+            gridState.peakEquity = initialEquity;
+            log(`💼 帳戶起始餘額: ${initialEquity.toFixed(2)}U（風控基準）`);
+        }
+    }
+    monitorGrid();
+})();
 
