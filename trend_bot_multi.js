@@ -180,10 +180,11 @@ async function getIndicators(symbol) {
         const atrArr     = ATR.calculate({ period: CONFIG.atrPeriod, high: highs, low: lows, close: closes });
         const rsiArr     = RSI.calculate({ period: CONFIG.rsiPeriod, values: closes });
 
-        // 計算成交量均量
-        const recentVols = volumes.slice(-CONFIG.volumeMaPeriod);
+        // 計算成交量均量（用倒數第二根已完成K線，避免最新未完成K線量能偏低）
+        const completedVols = volumes.slice(0, -1); // 排除最新未完成K線
+        const recentVols = completedVols.slice(-CONFIG.volumeMaPeriod);
         const volMa = recentVols.reduce((a, b) => a + b, 0) / recentVols.length;
-        const currentVol = volumes[volumes.length - 1];
+        const currentVol = completedVols[completedVols.length - 1]; // 最近完成的K線量能
 
         return {
             emaFast:     emaFastArr[emaFastArr.length - 1],
@@ -376,6 +377,17 @@ async function monitorTrend() {
     log(`💰 投入: ${CONFIG.investment}U | 槓桿: ${CONFIG.leverage}x | RSI上限: ${CONFIG.rsiMaxBuy} | 量能需: ${CONFIG.volumeMinRatio}x`);
     if (CONFIG.simMode) log('⚠️ 模擬模式開啟，不會實際下單');
     logExchangeInfo();
+
+    // 啟動時讀取實際帳戶餘額作為風控基準
+    if (!CONFIG.simMode) {
+        const initialEquity = await getCurrentEquity();
+        if (initialEquity !== null) {
+            botState.entryEquity = initialEquity;
+            botState.peakEquity = initialEquity;
+            log(`💼 帳戶起始餘額: ${initialEquity.toFixed(2)}U（風控基準）`);
+        }
+    }
+
     scheduleDailyReport();
 
     while (true) {
