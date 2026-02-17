@@ -19,6 +19,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 import { EMA, ATR, RSI } from 'technicalindicators';
 import {
     EXCHANGE_NAME,
@@ -69,7 +70,37 @@ const CONFIG = {
     maxDrawdownPercent: 0.30,      // 最大回撤 30% 停止
 
     simMode: process.env.TREND_SIM_MODE === 'true' || false,
+
+    // 自動輪動（若 TREND_SYMBOL 未設定才啟用）
+    enableRotation: !process.env.TREND_SYMBOL,
+    rotationInterval: 60000 * 60 * 4,          // 每 4 小時評估一次
+    rotationCooldown: 60000 * 60 * 2,          // 輪動後 2 小時內不再輪動
+    rotationImprovementThreshold: 1.3,         // 分數需高 30% 以上才切換
+    rotationOnlyWhenNoPosition: false,         // true = 只在空倉時才輪動
 };
+
+// backtest.db 讀取（用於自動輪動評分）
+const _require = createRequire(import.meta.url);
+let _btDb = null;
+
+function getBacktestScore(symbol) {
+    try {
+        const dbPath = path.join(__dirname, 'backtest.db');
+        if (!fs.existsSync(dbPath)) return null;
+        if (!_btDb) {
+            const Database = _require('better-sqlite3');
+            _btDb = new Database(dbPath, { readonly: true });
+        }
+        const row = _btDb.prepare(
+            `SELECT AVG(total_pnl_pct) as avg_pnl, AVG(max_drawdown) as avg_dd
+             FROM backtest_runs WHERE symbol = ?`
+        ).get(symbol);
+        if (!row || row.avg_pnl === null) return null;
+        return { pnl: row.avg_pnl, drawdown: row.avg_dd };
+    } catch (e) {
+        return null;
+    }
+}
 
 // NanoClaw IPC 通知
 const NANOCLAW_IPC_DIR = process.env.NANOCLAW_IPC_DIR || '/home/mky/nanoclaw/data/ipc/main/messages';
@@ -86,6 +117,8 @@ let botState = {
     entryEquity: CONFIG.investment,
     tradeCount: 0,
     lastReportDate: '',
+    lastRotationCheck: 0,
+    lastRotationTime: 0,
 };
 
 // ========== 初始化交易所 ==========
@@ -137,7 +170,23 @@ async function readMarketData() {
     }
 }
 
-// ========== 選幣（從環境變數或 market_data.json） ==========
+// ========== 選幣（從環境變數或 market_data.json + 回測評分） ==========
+
+// 計算幣種綜合分數（波動性 50% + 回測報酬 30% + 低回撤 20%）
+function calcCombinedScore(item) {
+    const vol = typeof item.volatilityScore === 'number' ? item.volatilityScore : 0;
+    let symbol = item.symbol;
+    if (!symbol.includes('/') && symbol.endsWith('USDT')) {
+        symbol = `${symbol.replace('USDT', '')}/USDT:USDT`;
+    }
+    const bt = getBacktestScore(symbol);
+    if (bt && bt.pnl > 0) {
+        const btScore = (bt.pnl / 100) * 0.3 - (bt.drawdown / 100) * 0.2;
+        return { symbol, score: vol * 0.5 + btScore, bt };
+    }
+    return { symbol, score: vol, bt: null };
+}
+
 async function selectSymbol() {
     // 優先使用環境變數指定的幣種
     if (process.env.TREND_SYMBOL) {
@@ -149,17 +198,80 @@ async function selectSymbol() {
         log('⚠️ market_data.json 無資料，等待市場掃描...');
         return null;
     }
-    const best = data.reduce((prev, curr) => {
-        const ps = typeof prev.volatilityScore === 'number' ? prev.volatilityScore : 0;
-        const cs = typeof curr.volatilityScore === 'number' ? curr.volatilityScore : 0;
-        return cs > ps ? curr : prev;
-    }, data[0]);
 
-    let symbol = best.symbol;
-    if (!symbol.includes('/') && symbol.endsWith('USDT')) {
-        symbol = `${symbol.replace('USDT', '')}/USDT:USDT`;
+    // 計算所有幣種分數並排序
+    const scored = data.map(item => calcCombinedScore(item));
+    scored.sort((a, b) => b.score - a.score);
+
+    const best = scored[0];
+    if (best.bt) {
+        log(`🏆 最佳幣種: ${best.symbol} | 分數: ${(best.score * 100).toFixed(2)} | 回測: +${best.bt.pnl.toFixed(1)}% | 回撤: ${best.bt.drawdown.toFixed(1)}%`);
+    } else {
+        log(`🏆 最佳幣種: ${best.symbol} | 波動分數: ${(best.score * 100).toFixed(2)} (無回測資料)`);
     }
-    return symbol;
+
+    return best.symbol;
+}
+
+// 自動輪動評估（每 4 小時）
+async function checkRotation() {
+    if (!CONFIG.enableRotation) return;
+    if (Date.now() - botState.lastRotationCheck < CONFIG.rotationInterval) return;
+    botState.lastRotationCheck = Date.now();
+
+    // 輪動冷卻中
+    if (botState.lastRotationTime > 0 && Date.now() - botState.lastRotationTime < CONFIG.rotationCooldown) {
+        const remain = Math.ceil((CONFIG.rotationCooldown - (Date.now() - botState.lastRotationTime)) / 60000);
+        log(`⏸️ 輪動冷卻中，還需 ${remain} 分鐘`);
+        return;
+    }
+
+    // 若設定為只在空倉時輪動
+    if (CONFIG.rotationOnlyWhenNoPosition && botState.position) {
+        log(`⏸️ 持倉中，等待平倉後再評估輪動`);
+        return;
+    }
+
+    log(`🔄 執行自動輪動評估...`);
+    const data = await readMarketData();
+    if (!data || data.length === 0) return;
+
+    const scored = data.map(item => calcCombinedScore(item));
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0];
+
+    if (!botState.symbol || best.symbol === botState.symbol) {
+        log(`✅ 目前幣種 ${botState.symbol} 已是最佳，無需輪動`);
+        return;
+    }
+
+    // 計算目前幣種分數
+    const currentData = data.find(item => {
+        let sym = item.symbol;
+        if (!sym.includes('/') && sym.endsWith('USDT')) sym = `${sym.replace('USDT', '')}/USDT:USDT`;
+        return sym === botState.symbol;
+    });
+    const currentScore = currentData ? calcCombinedScore(currentData).score : 0;
+    const improvementRatio = currentScore > 0 ? best.score / currentScore : Infinity;
+
+    log(`📊 目前: ${botState.symbol} (${(currentScore * 100).toFixed(2)}) | 候選: ${best.symbol} (${(best.score * 100).toFixed(2)}) | 改善: ${improvementRatio.toFixed(2)}x`);
+
+    if (improvementRatio >= CONFIG.rotationImprovementThreshold) {
+        log(`✅ 分數改善 ${((improvementRatio - 1) * 100).toFixed(0)}%，觸發輪動！`);
+        notifyUser(`🔄 趨勢機器人輪動！\n${botState.symbol} → ${best.symbol}\n改善: ${((improvementRatio - 1) * 100).toFixed(0)}%`);
+
+        // 平掉目前倉位
+        if (botState.position) {
+            await closePosition(botState.symbol, `輪動至 ${best.symbol}`);
+        }
+
+        botState.symbol = best.symbol;
+        botState.lastSignal = null;  // 重置訊號，等待新幣種黃金交叉
+        botState.lastRotationTime = Date.now();
+        log(`✅ 輪動完成，現在監控: ${best.symbol}`);
+    } else {
+        log(`⏸️ 改善幅度不足 (需 ${CONFIG.rotationImprovementThreshold}x)，保持 ${botState.symbol}`);
+    }
 }
 
 // ========== 技術指標（含 RSI + 量能） ==========
@@ -390,6 +502,20 @@ async function monitorTrend() {
 
     scheduleDailyReport();
 
+    // 啟動時先選幣
+    if (!botState.symbol) {
+        const initialSymbol = await selectSymbol();
+        if (initialSymbol) {
+            botState.symbol = initialSymbol;
+            log(`📥 啟動交易對: ${initialSymbol}`);
+        }
+        botState.lastRotationCheck = Date.now(); // 啟動後 4 小時再評估輪動
+    }
+
+    if (CONFIG.enableRotation) {
+        log(`🔄 自動輪動已啟用（每 ${CONFIG.rotationInterval / 60000} 分鐘評估，分數改善需 ${CONFIG.rotationImprovementThreshold}x）`);
+    }
+
     while (true) {
         try {
             // 0. 風控檢查
@@ -401,19 +527,22 @@ async function monitorTrend() {
                 process.exit(1);
             }
 
-            // 1. 選幣
-            const symbol = await selectSymbol();
-            if (!symbol) {
-                await new Promise(r => setTimeout(r, CONFIG.checkInterval));
-                continue;
-            }
-            if (botState.symbol !== symbol) {
-                log(`📥 交易對: ${symbol}`);
-                if (botState.position) await closePosition(botState.symbol, `切換幣種至 ${symbol}`);
+            // 1. 自動輪動評估（每 4 小時，TREND_SYMBOL 固定時跳過）
+            await checkRotation();
+
+            // 2. 選幣（首次選幣，之後由輪動控制）
+            if (!botState.symbol) {
+                const symbol = await selectSymbol();
+                if (!symbol) {
+                    await new Promise(r => setTimeout(r, CONFIG.checkInterval));
+                    continue;
+                }
+                log(`📥 初始交易對: ${symbol}`);
                 botState.symbol = symbol;
             }
+            const symbol = botState.symbol;
 
-            // 2. 取得指標
+            // 3. 取得指標
             const ind = await getIndicators(symbol);
             if (!ind) {
                 await new Promise(r => setTimeout(r, CONFIG.checkInterval));
@@ -425,7 +554,7 @@ async function monitorTrend() {
 
             log(`📊 ${symbol} | 價格: ${currentPrice.toFixed(4)} | EMA${CONFIG.emaFast}: ${emaFast.toFixed(4)} | EMA${CONFIG.emaSlow}: ${emaSlow.toFixed(4)} | ATR: ${atr.toFixed(4)} | RSI: ${rsi.toFixed(1)} | 量能: ${volRatio}x`);
 
-            // 3. 持倉管理（移動停損 + 固定停損 + 死叉出場）
+            // 4. 持倉管理（移動停損 + 固定停損 + 死叉出場）
             if (botState.position) {
                 const { stopLoss, trailActivated, trailStop } = botState.position;
 
@@ -446,7 +575,7 @@ async function monitorTrend() {
                 }
             }
 
-            // 4. 進場訊號（黃金交叉 + RSI + 量能）
+            // 5. 進場訊號（黃金交叉 + RSI + 量能）
             const isGoldenCross = emaFastPrev <= emaSlowPrev && emaFast > emaSlow;
 
             if (isGoldenCross && botState.lastSignal !== 'golden_cross' && !botState.position) {
