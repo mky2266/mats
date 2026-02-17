@@ -750,13 +750,23 @@ async function monitorGrid() {
                 }
             }
 
-            // 2. 破網檢查
-            if (price > gridState.upperPrice || price < gridState.lowerPrice) {
+            // 2. 破網檢查（只在網格已啟動時才判斷）
+            if (gridState.isActive && (price > gridState.upperPrice || price < gridState.lowerPrice)) {
                 if (CONFIG.autoRebalance) {
                     if (Date.now() - gridState.lastRebalanceTime > CONFIG.rebalanceCooldown) {
                         log(`🔄 破網重置...`);
                         await initializeGrid();
                     }
+                }
+            }
+
+            // 2b. 網格未啟動時，定期重試（每 5 分鐘）
+            if (!gridState.isActive) {
+                const RETRY_INTERVAL = 60000 * 5;
+                if (Date.now() - (gridState.lastInitRetry || 0) > RETRY_INTERVAL) {
+                    gridState.lastInitRetry = Date.now();
+                    log(`⏳ 網格未啟動，重新嘗試初始化...`);
+                    await initializeGrid();
                 }
             }
 
