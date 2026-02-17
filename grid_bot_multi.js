@@ -2,8 +2,7 @@ import ccxt from 'ccxt';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath, URL } from 'url';
-import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 import { ATR } from 'technicalindicators';
 import { 
     EXCHANGE_NAME, 
@@ -98,7 +97,6 @@ let gridState = {
     lastRotationCheck: Date.now(),
     lastRotationTime: 0,
     entryEquity: CONFIG.investment,
-    lastTrendNotifyTime: 0,         // 趨勢過濾通知冷卻（避免重複發送）
 
     // 風控狀態
     peakEquity: CONFIG.investment,  // 歷史最高權益（用於計算回撤）
@@ -291,30 +289,6 @@ async function readMarketData() {
     }
 }
 
-// 從 backtest.db 讀取幣種的回測分數（若有）
-// 回傳 { pnl, drawdown } 或 null
-const _require = createRequire(import.meta.url);
-let _btDb = null;
-
-function getBacktestScore(symbol) {
-    try {
-        const dbPath = path.join(__dirname, 'backtest.db');
-        if (!fs.existsSync(dbPath)) return null;
-        if (!_btDb) {
-            const Database = _require('better-sqlite3');
-            _btDb = new Database(dbPath, { readonly: true });
-        }
-        const row = _btDb.prepare(
-            `SELECT AVG(total_pnl_pct) as avg_pnl, AVG(max_drawdown) as avg_dd
-             FROM backtest_runs WHERE symbol = ?`
-        ).get(symbol);
-        if (!row || row.avg_pnl === null) return null;
-        return { pnl: row.avg_pnl, drawdown: row.avg_dd };
-    } catch (e) {
-        return null;
-    }
-}
-
 async function findBestCandidateFromData() {
     log(`🔍 讀取 market_data.json 尋找最佳網格幣種...`);
     const marketData = await readMarketData();
@@ -331,6 +305,8 @@ async function findBestCandidateFromData() {
             const base = item.symbol.replace('USDT', '');
             item.symbol = `${base}/USDT:USDT`;
         }
+        
+        // 檢查成交量（如果有配置）
         if (CONFIG.minVolumeForRotation && item.volume_4h) {
             return item.volume_4h > CONFIG.minVolumeForRotation;
         }
@@ -342,38 +318,26 @@ async function findBestCandidateFromData() {
         return { symbol: CONFIG.symbol, score: 0 };
     }
 
-    // 計算波動性分數
+    // 計算或獲取波動性分數
     for (let item of validCandidates) {
         if (!item.volatilityScore || item.volatilityScore === 0) {
+            // 如果沒有波動性分數，實時計算
             const score = await getVolatilityScore(item.symbol);
             item.volatilityScore = score;
         }
     }
 
-    // 嘗試從 backtest.db 取得回測分數，做綜合評分
-    const scored = validCandidates.map(item => {
-        const vol = typeof item.volatilityScore === 'number' ? item.volatilityScore : 0;
-        const bt = getBacktestScore(item.symbol);
-        let finalScore;
-        if (bt && bt.pnl > 0) {
-            // 有回測資料：波動性 50% + 回測報酬 30% + 低回撤 20%
-            const btScore = (bt.pnl / 100) * 0.3 - (bt.drawdown / 100) * 0.2;
-            finalScore = vol * 0.5 + btScore;
-            log(`  ${item.symbol}: 波動${(vol*100).toFixed(1)}% | 回測+${bt.pnl.toFixed(1)}% | 回撤${bt.drawdown.toFixed(1)}% → 綜合${(finalScore*100).toFixed(2)}`);
-        } else {
-            // 無回測資料：純波動性
-            finalScore = vol;
-            log(`  ${item.symbol}: 波動${(vol*100).toFixed(1)}% (無回測資料)`);
-        }
-        return { ...item, finalScore };
-    });
+    // 找出波動性最高的幣種
+    const bestCandidate = validCandidates.reduce((prev, current) => {
+        const prevScore = typeof prev.volatilityScore === 'number' ? prev.volatilityScore : 0;
+        const currentScore = typeof current.volatilityScore === 'number' ? current.volatilityScore : 0;
+        return (prevScore > currentScore) ? prev : current;
+    }, { symbol: CONFIG.symbol, volatilityScore: 0 });
 
-    // 依分數由高到低排序，回傳完整清單供備選
-    scored.sort((a, b) => b.finalScore - a.finalScore);
-    const bestCandidate = scored[0] || { symbol: CONFIG.symbol, finalScore: 0 };
-
-    log(`✅ 最佳幣種: ${bestCandidate.symbol} (綜合分數: ${(bestCandidate.finalScore * 100).toFixed(2)})`);
-    return { symbol: bestCandidate.symbol, score: bestCandidate.finalScore, allCandidates: scored };
+    log(`✅ 最佳幣種: ${bestCandidate.symbol} (波動性分數: ${(bestCandidate.volatilityScore * 100).toFixed(2)}%)`);
+    log(`📊 當前幣種: ${CONFIG.symbol} 的波動性將在切換前重新評估`);
+    
+    return { symbol: bestCandidate.symbol, score: bestCandidate.volatilityScore };
 }
 
 async function closeAllPositions(symbol) {
@@ -421,33 +385,11 @@ async function initializeGrid() {
 
         let currentSymbol = CONFIG.symbol;
 
-        // 趨勢過濾：橫盤才開網格，最佳幣種趨勢時嘗試備選
-        const allCandidates = best.allCandidates || [{ symbol: currentSymbol, finalScore: best.score }];
-        let foundSideways = false;
-
-        for (const candidate of allCandidates) {
-            const sym = candidate.symbol || currentSymbol;
-            const sideways = await isSidewaysMarket(sym);
-            if (sideways) {
-                if (sym !== currentSymbol) {
-                    log(`🔀 備選幣種 ${sym} 為橫盤，切換至此幣種`);
-                    CONFIG.symbol = sym;
-                    currentSymbol = sym;
-                }
-                foundSideways = true;
-                break;
-            } else {
-                log(`⏭️ ${sym} 趨勢中，嘗試下一個...`);
-            }
-        }
-
-        if (!foundSideways) {
-            log(`⚠️ [趨勢過濾] 所有候選幣種均為趨勢行情，暫停等待橫盤...`);
-            const TREND_NOTIFY_COOLDOWN = 60 * 60 * 1000; // 1小時通知一次
-            if (Date.now() - gridState.lastTrendNotifyTime > TREND_NOTIFY_COOLDOWN) {
-                notifyUser(`⚠️ 趨勢過濾：所有候選幣種均在趨勢中，暫停開網格（每小時通知一次）`);
-                gridState.lastTrendNotifyTime = Date.now();
-            }
+        // 趨勢過濾：橫盤才開網格
+        const sideways = await isSidewaysMarket(currentSymbol);
+        if (!sideways) {
+            log(`⚠️ [趨勢過濾] ${currentSymbol} 目前處於趨勢行情，暫停開網格，等待橫盤...`);
+            notifyUser(`⚠️ 趨勢過濾：${currentSymbol} 趨勢行情，暫停開網格`);
             return;
         }
 
@@ -485,27 +427,12 @@ async function initializeGrid() {
 
         const currentPrice = await getMarketPrice(currentSymbol);
         let gridStep = 0;
-        let atrMultiplier = CONFIG.atrMultiplier;
 
         if (CONFIG.useAtrGrid) {
             const atr = await getATR(currentSymbol, CONFIG.atrPeriod);
-            // 動態 ATR 倍數：根據 ATR/價格比例自動調整
-            // ATR/價格 > 5% → 波動大，格距縮小（倍數降低），避免掛單太稀疏
-            // ATR/價格 < 1% → 波動小，格距放大（倍數提高），確保有利潤空間
-            const atrRatio = atr / currentPrice;
-            if (atrRatio > 0.05) {
-                atrMultiplier = 0.8;  // 波動大：縮小格距
-            } else if (atrRatio > 0.03) {
-                atrMultiplier = 1.0;
-            } else if (atrRatio > 0.015) {
-                atrMultiplier = 1.2;  // 預設
-            } else {
-                atrMultiplier = 1.5;  // 波動小：放大格距
-            }
-            gridStep = atr * atrMultiplier;
-            log(`📐 ATR: ${atr.toFixed(4)} | ATR/價格比: ${(atrRatio*100).toFixed(2)}% | 格距倍數: ${atrMultiplier}x`);
+            gridStep = atr * CONFIG.atrMultiplier;
         } else {
-            gridStep = currentPrice * 0.01;
+            gridStep = currentPrice * 0.01; 
         }
 
         const range = gridStep * CONFIG.gridCount;
@@ -514,7 +441,7 @@ async function initializeGrid() {
 
         log(`=== 初始化網格 [${currentSymbol}] ===`);
         log(`區間: ${lowerPrice.toFixed(4)} - ${upperPrice.toFixed(4)}`);
-        log(`格距: ${gridStep.toFixed(4)} | 格數: ${CONFIG.gridCount} | ATR倍數: ${atrMultiplier}x`);
+        log(`格距: ${gridStep.toFixed(4)} | 格數: ${CONFIG.gridCount}`);
 
         if (!CONFIG.simMode) {
             await exchange.cancelAllOrders(currentSymbol);
@@ -591,13 +518,7 @@ async function initializeGrid() {
             orders: newOrders,
             lastRebalanceTime: Date.now(),
             lastRotationCheck: Date.now(),
-            lastRotationTime: gridState.lastRotationTime || 0,
-            lastTrendNotifyTime: gridState.lastTrendNotifyTime || 0,
-            entryEquity: gridState.entryEquity,
-            peakEquity: gridState.peakEquity,
-            dailyLoss: gridState.dailyLoss || 0,
-            dailyLossDate: gridState.dailyLossDate || '',
-            stopLossTriggered: false,
+            entryEquity: gridState.entryEquity
         };
 
         notifyUser(`🕸️ 網格機器人啟動 [${currentSymbol}]\n區間: ${lowerPrice.toFixed(4)} - ${upperPrice.toFixed(4)}`);
@@ -750,23 +671,13 @@ async function monitorGrid() {
                 }
             }
 
-            // 2. 破網檢查（只在網格已啟動時才判斷）
-            if (gridState.isActive && (price > gridState.upperPrice || price < gridState.lowerPrice)) {
+            // 2. 破網檢查
+            if (price > gridState.upperPrice || price < gridState.lowerPrice) {
                 if (CONFIG.autoRebalance) {
                     if (Date.now() - gridState.lastRebalanceTime > CONFIG.rebalanceCooldown) {
                         log(`🔄 破網重置...`);
                         await initializeGrid();
                     }
-                }
-            }
-
-            // 2b. 網格未啟動時，定期重試（每 5 分鐘）
-            if (!gridState.isActive) {
-                const RETRY_INTERVAL = 60000 * 5;
-                if (Date.now() - (gridState.lastInitRetry || 0) > RETRY_INTERVAL) {
-                    gridState.lastInitRetry = Date.now();
-                    log(`⏳ 網格未啟動，重新嘗試初始化...`);
-                    await initializeGrid();
                 }
             }
 
@@ -847,17 +758,5 @@ async function monitorGrid() {
 
 logExchangeInfo();
 log('🚀 網格機器人 3.2 (多交易所支援) 啟動...');
-
-// 啟動時讀取實際帳戶餘額作為風控基準
-(async () => {
-    if (!CONFIG.simMode) {
-        const initialEquity = await getCurrentEquity();
-        if (initialEquity !== null) {
-            gridState.entryEquity = initialEquity;
-            gridState.peakEquity = initialEquity;
-            log(`💼 帳戶起始餘額: ${initialEquity.toFixed(2)}U（風控基準）`);
-        }
-    }
-    monitorGrid();
-})();
+monitorGrid();
 
